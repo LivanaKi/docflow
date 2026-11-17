@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package docflow.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/LivanaKi/docflow/gen/docflow/v1;docflowv1";
+
+service ConversionService {
+  rpc CreateConversion(CreateConversionRequest) returns (CreateConversionResponse);
+  rpc GetConversion(GetConversionRequest) returns (GetConversionResponse);
+}
+
+enum ConversionStatus {
+  CONVERSION_STATUS_UNSPECIFIED = 0;
+  CONVERSION_STATUS_PENDING = 1;
+  CONVERSION_STATUS_PROCESSING = 2;
+  CONVERSION_STATUS_COMPLETED = 3;
+  CONVERSION_STATUS_FAILED = 4;
+}
+
+message Conversion {
+  string id = 1;
+  string source_url = 2;
+  string target_format = 3;
+  ConversionStatus status = 4;
+  string result_url = 5;
+  string error = 6;
+  google.protobuf.Timestamp created_at = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+message CreateConversionRequest {
+  string source_url = 1;
+  string target_format = 2;
+  string idempotency_key = 3;
+}
+
+message CreateConversionResponse {
+  Conversion conversion = 1;
+}
+
+message GetConversionRequest {
+  string id = 1;
+}
+
+message GetConversionResponse {
+  Conversion conversion = 1;
+}
