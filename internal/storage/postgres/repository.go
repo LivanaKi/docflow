@@ -48,11 +48,11 @@ func scanConversion(row pgx.Row) (domain.Conversion, error) {
 	err := row.Scan(&c.ID, &c.IdempotencyKey, &c.SourceURL, &c.TargetFormat, &status,
 		&c.ResultURL, &c.Error, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return c, domain.ErrNotFound
+		return domain.Conversion{}, domain.ErrNotFound
 	}
 
 	if err != nil {
-		return c, err
+		return domain.Conversion{}, err
 	}
 
 	c.Status = domain.Status(status)
@@ -107,4 +107,97 @@ func (r *Repository) CreateWithEvent(ctx context.Context, c domain.Conversion, m
 	}
 
 	return created, nil
+}
+
+// UpdateStatus saves c only if its stored status still equals from
+// (optimistic concurrency). If another process changed the status first,
+// it returns domain.ErrInvalidTransition.
+func (r *Repository) UpdateStatus(ctx context.Context, c domain.Conversion, from domain.Status) error {
+	tag, err := r.pool.Exec(ctx, `UPDATE conversions SET status = $1, result_url = $2, error = $3, updated_at = $4 
+                   WHERE id = $5 AND status = $6`, string(c.Status), c.ResultURL, c.Error, c.UpdatedAt, c.ID, string(from))
+	if err != nil {
+		return fmt.Errorf("update conversion: %w", err)
+	}
+
+	if tag.RowsAffected() == 0 {
+		return domain.ErrInvalidTransition
+	}
+
+	return nil
+}
+
+// PublishOutbox locks up to limit unpublished messages, passes them to publish
+// and marks them as published in the same transaction.
+//
+// FOR UPDATE SKIP LOCKED lets several relay instances run in parallel without
+// taking the same rows. If publish succeeds but the commit fails, messages are
+// sent again on the next run, so delivery is at-least-once.
+func (r *Repository) PublishOutbox(ctx context.Context, limit int,
+	publish func(context.Context, []domain.OutboxMessage) error) (int, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Крок 1: вибрати і заблокувати пачку
+	rows, err := tx.Query(ctx,
+		`SELECT id, topic, key, payload FROM outbox
+		 WHERE published_at IS NULL
+		 ORDER BY id
+		 LIMIT $1
+		 FOR UPDATE SKIP LOCKED`, limit)
+	if err != nil {
+		return 0, fmt.Errorf("select outbox: %w", err)
+	}
+
+	var (
+		ids  []int64
+		msgs []domain.OutboxMessage
+	)
+
+	// Крок 2: прочитати рядки
+	for rows.Next() {
+		var (
+			id  int64
+			msg domain.OutboxMessage
+		)
+
+		if err := rows.Scan(&id, &msg.Topic, &msg.Key, &msg.Payload); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan outbox: %w", err)
+		}
+
+		ids = append(ids, id)
+		msgs = append(msgs, msg)
+	}
+
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("read outbox: %w", err)
+	}
+
+	// Крок 3: нічого відправляти — виходимо
+	if len(msgs) == 0 {
+		return 0, nil
+	}
+
+	// Крок 4: відправити в Kafka (функція прийшла параметром)
+	if err := publish(ctx, msgs); err != nil {
+		return 0, fmt.Errorf("publish: %w", err)
+	}
+
+	// Крок 5: позначити відправленими
+	_, err = tx.Exec(ctx, `UPDATE outbox SET published_at = now() WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return 0, fmt.Errorf("mark published: %w", err)
+	}
+
+	// Крок 6: зафіксувати
+	err = tx.Commit(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+
+	return len(msgs), nil
 }
